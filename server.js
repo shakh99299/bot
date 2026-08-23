@@ -8,7 +8,7 @@ const BOT_TOKEN = process.env.BOT_TOKEN?.trim();
 const OWNER_CHAT_ID = process.env.OWNER_CHAT_ID?.trim() || '';
 const DATA_DIR = process.env.DATA_DIR?.trim() || '/app/data';
 const PUBLIC_URL = process.env.PUBLIC_URL?.trim().replace(/\/$/, '') || '';
-const POLL_TIMEOUT = 25;
+const RAILWAY_PUBLIC_DOMAIN = process.env.RAILWAY_PUBLIC_DOMAIN?.trim().replace(/^https?:\/\//, '').replace(/\/$/, '') || '';
 
 if (!BOT_TOKEN) {
   console.error('BOT_TOKEN is missing. Set it in Railway Variables.');
@@ -55,20 +55,47 @@ async function tg(method, body) {
 }
 
 async function send(chatId, message) {
-  return tg('sendMessage', { chat_id: chatId, text: message, disable_web_page_preview: true });
+  return tg('sendMessage', {
+    chat_id: chatId,
+    text: message,
+    disable_web_page_preview: true
+  });
 }
 
-async function getPublicBase(request) {
+function getPublicBase(request) {
   if (PUBLIC_URL) return PUBLIC_URL;
+  if (RAILWAY_PUBLIC_DOMAIN) return `https://${RAILWAY_PUBLIC_DOMAIN}`;
   const host = request.headers.host;
   if (!host) throw new Error('Public hostname not available. Set PUBLIC_URL in Railway Variables.');
   const proto = request.headers['x-forwarded-proto'] || 'https';
   return `${proto}://${host}`;
 }
 
+// Telegram retries webhook deliveries in some failure cases. Keep a process-local
+// update cache so one update can never be handled twice by this process.
+const seenUpdates = new Set();
+const MAX_SEEN_UPDATES = 5000;
+
+function markUpdateSeen(updateId) {
+  if (seenUpdates.has(updateId)) return false;
+  seenUpdates.add(updateId);
+  if (seenUpdates.size > MAX_SEEN_UPDATES) {
+    const first = seenUpdates.values().next().value;
+    seenUpdates.delete(first);
+  }
+  return true;
+}
+
 async function handleUpdate(update, request) {
+  const updateId = update?.update_id;
+  if (Number.isInteger(updateId) && !markUpdateSeen(updateId)) {
+    console.log(`Duplicate update ignored: ${updateId}`);
+    return;
+  }
+
   const m = update?.message;
   if (!m?.chat?.id) return;
+
   const chatId = String(m.chat.id);
   const textValue = String(m.text || '').trim();
 
@@ -88,7 +115,7 @@ async function handleUpdate(update, request) {
   if (!doc) return;
 
   const name = String(doc.file_name || '').trim();
-  if (!/\.(html?|HTML?)$/.test(name)) {
+  if (!/\.(html|htm)$/i.test(name)) {
     await send(chatId, '❌ Faqat .html yoki .htm fayl yuboring.');
     return;
   }
@@ -111,55 +138,60 @@ async function handleUpdate(update, request) {
     const buffer = Buffer.from(await r.arrayBuffer());
     await fs.writeFile(target, buffer, { flag: 'wx' });
 
-    const base = await getPublicBase(request);
+    const base = getPublicBase(request);
     await send(chatId, `✅ Tayyor!\n\n${base}/${id}`);
+    console.log(`Created ${id} for update ${updateId ?? 'unknown'}`);
   } catch (err) {
     console.error(err);
     await send(chatId, `❌ Xato: ${err?.message || 'unknown error'}`);
   }
 }
 
-let offset = 0;
-let polling = false;
-
-async function poll() {
-  if (polling) return;
-  polling = true;
-  try {
-    while (true) {
-      try {
-        const updates = await tg('getUpdates', {
-          offset,
-          timeout: POLL_TIMEOUT,
-          allowed_updates: ['message']
-        });
-        for (const update of updates) {
-          offset = Math.max(offset, update.update_id + 1);
-          try {
-            await handleUpdate(update, currentRequestForLinks);
-          } catch (e) {
-            console.error('Update error:', e);
-          }
-        }
-      } catch (e) {
-        console.error('Telegram polling error:', e?.message || e);
-        await new Promise(r => setTimeout(r, 2000));
-      }
-    }
-  } finally {
-    polling = false;
+async function setupWebhook() {
+  const domain = RAILWAY_PUBLIC_DOMAIN || (PUBLIC_URL ? new URL(PUBLIC_URL).host : '');
+  if (!domain) {
+    throw new Error('Railway public domain not found. Generate a Railway domain first, or set PUBLIC_URL.');
   }
+
+  const webhookUrl = `${PUBLIC_URL || `https://${domain}`}/telegram/webhook`;
+  const result = await tg('setWebhook', {
+    url: webhookUrl,
+    allowed_updates: ['message'],
+    drop_pending_updates: true,
+    max_connections: 40
+  });
+  console.log(`Telegram webhook set: ${webhookUrl}`, result);
 }
 
-let currentRequestForLinks = null;
-
 const server = http.createServer(async (req, res) => {
-  currentRequestForLinks = req;
   try {
     const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
 
     if (req.method === 'GET' && url.pathname === '/health') {
       return json(res, 200, { ok: true });
+    }
+
+    if (req.method === 'POST' && url.pathname === '/telegram/webhook') {
+      let body = '';
+      for await (const chunk of req) body += chunk;
+
+      let update;
+      try {
+        update = JSON.parse(body);
+      } catch {
+        return text(res, 400, 'Bad Request');
+      }
+
+      // Acknowledge Telegram immediately. This prevents slow file downloads from
+      // causing Telegram to retry the same update.
+      res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end('OK');
+
+      // Process asynchronously after the HTTP 200 response.
+      void handleUpdate(update, req).catch(err => {
+        console.error('Webhook update error:', err?.message || err);
+      });
+      return;
     }
 
     if (req.method !== 'GET' && req.method !== 'HEAD') {
@@ -198,11 +230,8 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, '0.0.0.0', async () => {
   console.log(`HTTP server listening on ${PORT}`);
   try {
-    await tg('deleteWebhook', { drop_pending_updates: true });
-    console.log('Telegram webhook cleared; starting long polling.');
-    poll();
+    await setupWebhook();
   } catch (e) {
-    console.error('Telegram startup error:', e?.message || e);
-    poll();
+    console.error('Telegram webhook setup error:', e?.message || e);
   }
 });
